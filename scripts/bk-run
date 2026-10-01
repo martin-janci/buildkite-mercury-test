@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Run the Buildkite pipeline on the CURRENT working tree, uncommitted and
+# untracked changes included, without touching your branch, index or files.
+#
+# It snapshots the working tree into a throwaway commit on top of HEAD,
+# pushes it to refs/heads/bk-tmp/<timestamp>, and asks Buildkite to build
+# exactly that commit.
+#
+#   BUILDKITE_API_TOKEN  API token with the write_builds scope
+#   BK_ORG               organization slug
+#   BK_PIPELINE          pipeline slug (default: buildkite-mercury-test)
+set -euo pipefail
+
+: "${BUILDKITE_API_TOKEN:?set BUILDKITE_API_TOKEN (scope: write_builds)}"
+: "${BK_ORG:?set BK_ORG to your Buildkite organization slug}"
+BK_PIPELINE=${BK_PIPELINE:-buildkite-mercury-test}
+
+cd "$(git rev-parse --show-toplevel)"
+
+# A private copy of the index, so `git add -A` never touches the real one.
+tmp_index=$(mktemp)
+trap 'rm -f "$tmp_index"' EXIT
+cp "$(git rev-parse --git-path index)" "$tmp_index"
+GIT_INDEX_FILE=$tmp_index git add -A
+tree=$(GIT_INDEX_FILE=$tmp_index git write-tree)
+
+base=$(git rev-parse HEAD)
+src_branch=$(git rev-parse --abbrev-ref HEAD)
+sha=$(git commit-tree "$tree" -p "$base" -m "bk-run: $src_branch + local changes")
+branch="bk-tmp/$(date +%Y%m%d-%H%M%S)"
+
+echo "snapshot $sha (on top of $(git rev-parse --short "$base"))"
+git diff --stat "$base" "$sha"
+git push -q origin "$sha:refs/heads/$branch"
+
+body=$(jq -n --arg c "$sha" --arg b "$branch" --arg m "bk-run: $src_branch + local changes" \
+  '{commit: $c, branch: $b, message: $m}')
+curl -fsS -X POST \
+  -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "$body" \
+  "https://api.buildkite.com/v2/organizations/$BK_ORG/pipelines/$BK_PIPELINE/builds" \
+  | jq -r '"build #\(.number): \(.web_url)"'

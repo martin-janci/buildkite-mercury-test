@@ -1,12 +1,13 @@
 steps:
-  - label: "🧪 Test mercury"
+  - label: "🧪 Process on mercury"
     agents:
       queue: "ubuntu-self-hosted"
     commands:
       - echo "=== BUILDKITE TEST ==="
       - hostname
       - whoami
-      - pwd
-      - nproc
-      - free -h
+      - git log -1 --format='commit %h (parent %p) - %s'
+      - echo "--- data/input.txt as seen on mercury:"
+      - cat data/input.txt
+      - echo "lines=$(wc -l < data/input.txt) sha256=$(sha256sum data/input.txt | cut -c1-12)"
       - echo "=== SUCCESS ==="
