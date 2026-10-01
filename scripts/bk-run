@@ -44,9 +44,16 @@ git push -q origin "$sha:refs/heads/$branch"
 
 body=$(jq -n --arg c "$sha" --arg b "$branch" --arg m "bk-run: $src_branch + local changes" \
   '{commit: $c, branch: $b, message: $m}')
-curl -fsS -X POST \
+resp=$(mktemp)
+trap 'rm -f "$tmp_index" "$resp"' EXIT
+status=$(curl -sS -o "$resp" -w '%{http_code}' -X POST \
   -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d "$body" \
-  "https://api.buildkite.com/v2/organizations/$BK_ORG/pipelines/$BK_PIPELINE/builds" \
-  | jq -r '"build #\(.number): \(.web_url)"'
+  "https://api.buildkite.com/v2/organizations/$BK_ORG/pipelines/$BK_PIPELINE/builds")
+if [[ $status != 201 ]]; then
+  echo "Buildkite refused the build (HTTP $status): $(jq -r '.message // .' < "$resp")" >&2
+  git push -q origin --delete "$branch" || true
+  exit 1
+fi
+jq -r '"build #\(.number): \(.web_url)"' < "$resp"
