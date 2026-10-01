@@ -1,13 +1,6 @@
 steps:
-  - label: "🧪 Process on mercury"
+  - label: "install toolchains"
     agents:
       queue: "ubuntu-self-hosted"
-    commands:
-      - echo "=== BUILDKITE TEST ==="
-      - hostname
-      - whoami
-      - git log -1 --format='commit %h (parent %p) - %s'
-      - echo "--- data/input.txt as seen on mercury:"
-      - cat data/input.txt
-      - echo "lines=$(wc -l < data/input.txt) sha256=$(sha256sum data/input.txt | cut -c1-12)"
-      - echo "=== SUCCESS ==="
+    timeout_in_minutes: 30
+    command: bash toolchains.sh
