@@ -3,15 +3,33 @@
 # untracked changes included, without touching your branch, index or files.
 #
 # It snapshots the working tree into a throwaway commit on top of HEAD,
-# pushes it to refs/heads/bk-tmp/<timestamp>, and asks Buildkite to build
-# exactly that commit.
+# pushes it to refs/heads/bk-tmp/<timestamp>, asks Buildkite to build
+# exactly that commit, waits for the build and prints its log.
 #
-#   BUILDKITE_API_TOKEN  API token with the write_builds scope
+#   scripts/bk-run              snapshot, build, wait, print the log
+#   scripts/bk-run --no-wait    snapshot and build, print only the link
+#   scripts/bk-run --watch N    wait for build N and print its log
+#
+# Exits 0 when the build passed, 1 otherwise. Ctrl-C stops waiting; the
+# build itself keeps running.
+#
+#   BUILDKITE_API_TOKEN  API token with the write_builds and read_builds scopes
 #                        (default: Keychain item "buildkite-api-token",
 #                        then the contents of ~/.config/buildkite/token)
 #   BK_ORG               organization slug (default: martin-janci)
 #   BK_PIPELINE          pipeline slug (default: buildkite-mercury-test)
+#   BK_TIMEOUT           seconds to wait for the build (default: 1800)
+#   BK_FULL_LOG=1        also print the checkout and the pipeline upload job
 set -euo pipefail
+
+usage() { sed -n 's/^#   scripts/scripts/p' "$0" >&2; exit 2; }
+mode=run
+case "${1:-}" in
+  "") ;;
+  --no-wait) mode=no-wait ;;
+  --watch) mode=watch; build_no=${2:-}; [[ $build_no =~ ^[0-9]+$ ]] || usage ;;
+  *) usage ;;
+esac
 
 if [[ -z "${BUILDKITE_API_TOKEN:-}" ]] && command -v security >/dev/null; then
   BUILDKITE_API_TOKEN=$(security find-generic-password -s buildkite-api-token -w 2>/dev/null || true)
@@ -20,18 +38,86 @@ token_file=~/.config/buildkite/token
 if [[ -z "${BUILDKITE_API_TOKEN:-}" && -r $token_file ]]; then
   BUILDKITE_API_TOKEN=$(tr -d '[:space:]' < "$token_file")
 fi
-: "${BUILDKITE_API_TOKEN:?set BUILDKITE_API_TOKEN or put it in ~/.config/buildkite/token (scope: write_builds)}"
+: "${BUILDKITE_API_TOKEN:?set BUILDKITE_API_TOKEN or put it in ~/.config/buildkite/token (scopes: write_builds, read_builds)}"
 BK_ORG=${BK_ORG:-martin-janci}
 BK_PIPELINE=${BK_PIPELINE:-buildkite-mercury-test}
+api="https://api.buildkite.com/v2/organizations/$BK_ORG/pipelines/$BK_PIPELINE"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+bk() { curl -fsS -H "Authorization: Bearer $BUILDKITE_API_TOKEN" "$@"; }
+
+# Strip colours, terminal modes and Buildkite's timestamp markers.
+clean_log() {
+  perl -pe 's/\e?_bk;t=\d+\a//g; s/\e\[[0-9;?]*[A-Za-z]//g; s/\e[=>]//g; s/\r//g'
+}
+
+# Print one job's log; without BK_FULL_LOG only what the step's own
+# commands printed, not the checkout before them.
+print_log() {
+  local id=$1
+  if ! bk -H "Accept: text/plain" "$api/builds/$build_no/jobs/$id/log" | clean_log > "$work/log"; then
+    echo "(no log)"
+    return
+  fi
+  if [[ -z ${BK_FULL_LOG:-} ]] && grep -q '^~~~ Running commands' "$work/log"; then
+    awk 'f; /^~~~ Running commands/ { f = 1 }' "$work/log"
+  else
+    cat "$work/log"
+  fi
+}
+
+watch_build() {
+  local state last="" deadline=$((SECONDS + ${BK_TIMEOUT:-1800}))
+  : > "$work/jobs.prev"
+  echo "waiting for build #$build_no (Ctrl-C stops waiting, not the build)" >&2
+  while :; do
+    bk "$api/builds/$build_no" > "$work/build.json"
+    state=$(jq -r .state "$work/build.json")
+    if [[ $state != "$last" ]]; then
+      echo "  build: $state" >&2
+      last=$state
+    fi
+    jq -r '.jobs[] | select(.type == "script")
+      | "  \(.name // .command): \(.state)\(if .agent then " on \(.agent.hostname)" else "" end)"' \
+      "$work/build.json" > "$work/jobs.now"
+    grep -Fxv -f "$work/jobs.prev" "$work/jobs.now" >&2 || true
+    mv "$work/jobs.now" "$work/jobs.prev"
+    case $state in passed | failed | canceled | skipped | not_run | blocked) break ;; esac
+    if ((SECONDS > deadline)); then
+      echo "gave up after ${BK_TIMEOUT:-1800}s; build #$build_no is still $state: $(jq -r .web_url "$work/build.json")" >&2
+      return 1
+    fi
+    sleep 5
+  done
+
+  jq -r '.jobs[] | select(.type == "script")
+    | [.id, (.name // .command), .state, (.command // "")] | @tsv' "$work/build.json" |
+    while IFS=$'\t' read -r id name jstate cmd; do
+      if [[ -z ${BK_FULL_LOG:-} && $cmd == "buildkite-agent pipeline upload"* && $jstate == passed ]]; then
+        continue
+      fi
+      echo
+      echo "━━━ $name ($jstate)"
+      print_log "$id"
+    done
+  echo
+  echo "━━━ build #$build_no $state: $(jq -r .web_url "$work/build.json")"
+  [[ $state == passed ]]
+}
+
+if [[ $mode == watch ]]; then
+  watch_build
+  exit
+fi
 
 cd "$(git rev-parse --show-toplevel)"
 
 # A private copy of the index, so `git add -A` never touches the real one.
-tmp_index=$(mktemp)
-trap 'rm -f "$tmp_index"' EXIT
-cp "$(git rev-parse --git-path index)" "$tmp_index"
-GIT_INDEX_FILE=$tmp_index git add -A
-tree=$(GIT_INDEX_FILE=$tmp_index git write-tree)
+cp "$(git rev-parse --git-path index)" "$work/index"
+GIT_INDEX_FILE=$work/index git add -A
+tree=$(GIT_INDEX_FILE=$work/index git write-tree)
 
 base=$(git rev-parse HEAD)
 src_branch=$(git rev-parse --abbrev-ref HEAD)
@@ -44,16 +130,19 @@ git push -q origin "$sha:refs/heads/$branch"
 
 body=$(jq -n --arg c "$sha" --arg b "$branch" --arg m "bk-run: $src_branch + local changes" \
   '{commit: $c, branch: $b, message: $m}')
-resp=$(mktemp)
-trap 'rm -f "$tmp_index" "$resp"' EXIT
-status=$(curl -sS -o "$resp" -w '%{http_code}' -X POST \
+status=$(curl -sS -o "$work/resp" -w '%{http_code}' -X POST \
   -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d "$body" \
-  "https://api.buildkite.com/v2/organizations/$BK_ORG/pipelines/$BK_PIPELINE/builds")
+  "$api/builds")
 if [[ $status != 201 ]]; then
-  echo "Buildkite refused the build (HTTP $status): $(jq -r '.message // .' < "$resp")" >&2
+  echo "Buildkite refused the build (HTTP $status): $(jq -r '.message // .' < "$work/resp")" >&2
   git push -q origin --delete "$branch" || true
   exit 1
 fi
-jq -r '"build #\(.number): \(.web_url)"' < "$resp"
+build_no=$(jq -r .number "$work/resp")
+echo "build #$build_no: $(jq -r .web_url "$work/resp")"
+
+if [[ $mode == run ]]; then
+  watch_build
+fi
