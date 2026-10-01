@@ -7,17 +7,21 @@
 # exactly that commit.
 #
 #   BUILDKITE_API_TOKEN  API token with the write_builds scope
-#                        (default: contents of ~/.config/buildkite/token)
-#   BK_ORG               organization slug
+#                        (default: Keychain item "buildkite-api-token",
+#                        then the contents of ~/.config/buildkite/token)
+#   BK_ORG               organization slug (default: martin-janci)
 #   BK_PIPELINE          pipeline slug (default: buildkite-mercury-test)
 set -euo pipefail
 
+if [[ -z "${BUILDKITE_API_TOKEN:-}" ]] && command -v security >/dev/null; then
+  BUILDKITE_API_TOKEN=$(security find-generic-password -s buildkite-api-token -w 2>/dev/null || true)
+fi
 token_file=~/.config/buildkite/token
 if [[ -z "${BUILDKITE_API_TOKEN:-}" && -r $token_file ]]; then
   BUILDKITE_API_TOKEN=$(tr -d '[:space:]' < "$token_file")
 fi
 : "${BUILDKITE_API_TOKEN:?set BUILDKITE_API_TOKEN or put it in ~/.config/buildkite/token (scope: write_builds)}"
-: "${BK_ORG:?set BK_ORG to your Buildkite organization slug}"
+BK_ORG=${BK_ORG:-martin-janci}
 BK_PIPELINE=${BK_PIPELINE:-buildkite-mercury-test}
 
 cd "$(git rev-parse --show-toplevel)"
